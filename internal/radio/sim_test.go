@@ -140,7 +140,7 @@ func TestDriverReadWriteAgainstSim(t *testing.T) {
 	sim2 := newSimRadio()
 	d2 := NewDriver(sim2, nil)
 	im.SetChannel(Channel{Number: 3, Name: "NEW", RXFreq: "446.00625", TXFreq: "446.00625", RXTone: "OFF", TXTone: "OFF", Power: "Mid", SigCode: 1, PTTID: "Off"})
-	if err := d2.WriteImage(im, nil, nil); err != nil {
+	if err := d2.WriteImage(im, nil, true, nil); err != nil {
 		t.Fatalf("WriteImage: %v", err)
 	}
 	if n := len(Blocks()); sim2.writes != n {

@@ -7,6 +7,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,13 +39,14 @@ COMMON FLAGS
   -addr MAC      connect to a specific radio address (from 'scan')
   -timeout DUR   scan/connect timeout (default 20s)
   -v             verbose: log every Bluetooth packet
+  -force-mismatch  allow write when image model differs from radio
 
 TYPICAL WORKFLOW
   1. uv28prog read  -o mine.json            (back up the radio first!)
   2. uv28prog export -i mine.json -o ch.csv
   3. edit ch.csv in a spreadsheet
   4. uv28prog import -i mine.json -csv ch.csv -o new.json
-  5. uv28prog write  -i new.json            (keeps an automatic backup)
+  5. uv28prog write  -i new.json -yes       (keeps an automatic backup)
 
 This talks to your own radio over its built-in Bluetooth module. Always keep
 the backup written by 'read' so you can restore the radio if needed.
@@ -84,64 +86,6 @@ func main() {
 	}
 }
 
-type flags struct {
-	in, out, csv, addr, backup string
-	timeout                    time.Duration
-	verbose, all, yes          bool
-	onlyChannels, noBackup     bool
-	full                       bool
-}
-
-func parse(args []string) (*flags, error) {
-	f := &flags{timeout: 20 * time.Second}
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		next := func() (string, error) {
-			if i+1 >= len(args) {
-				return "", fmt.Errorf("flag %s needs a value", a)
-			}
-			i++
-			return args[i], nil
-		}
-		var err error
-		switch a {
-		case "-i", "-in":
-			f.in, err = next()
-		case "-o", "-out":
-			f.out, err = next()
-		case "-csv":
-			f.csv, err = next()
-		case "-addr":
-			f.addr, err = next()
-		case "-backup":
-			f.backup, err = next()
-		case "-timeout":
-			var s string
-			if s, err = next(); err == nil {
-				f.timeout, err = time.ParseDuration(s)
-			}
-		case "-v", "-verbose":
-			f.verbose = true
-		case "-all":
-			f.all = true
-		case "-yes", "-y":
-			f.yes = true
-		case "-only-channels":
-			f.onlyChannels = true
-		case "-full":
-			f.full = true
-		case "-no-backup":
-			f.noBackup = true
-		default:
-			return nil, fmt.Errorf("unknown flag %q", a)
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-	return f, nil
-}
-
 func logger(verbose bool) radio.Logger {
 	if !verbose {
 		return func(string, ...any) {}
@@ -166,12 +110,16 @@ func progressBar(label string) radio.Progress {
 }
 
 func cmdScan(args []string) error {
-	f, err := parse(args)
-	if err != nil {
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	addr := fs.String("addr", "", "connect to a specific radio address (from 'scan')")
+	timeout := fs.Duration("timeout", 20*time.Second, "scan/connect timeout")
+	verbose := fs.Bool("v", false, "verbose: log every Bluetooth packet")
+	fs.BoolVar(verbose, "verbose", false, "verbose: log every Bluetooth packet")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Scanning for radios (turn the radio on, keep it close)...")
-	found, err := Scan(f.timeout, f.addr, logger(f.verbose))
+	found, err := Scan(*timeout, *addr, logger(*verbose))
 	if err != nil {
 		return err
 	}
@@ -187,20 +135,25 @@ func cmdScan(args []string) error {
 }
 
 func cmdRead(args []string) error {
-	f, err := parse(args)
-	if err != nil {
+	fs := flag.NewFlagSet("read", flag.ContinueOnError)
+	out := fs.String("o", "", "output image file (JSON)")
+	fs.StringVar(out, "out", "", "output image file (JSON)")
+	addr := fs.String("addr", "", "connect to a specific radio address")
+	timeout := fs.Duration("timeout", 20*time.Second, "scan/connect timeout")
+	verbose := fs.Bool("v", false, "verbose: log every Bluetooth packet")
+	fs.BoolVar(verbose, "verbose", false, "verbose: log every Bluetooth packet")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	out := f.out
-	if out == "" {
-		out = fmt.Sprintf("uv28-%s.json", time.Now().Format("20060102-150405"))
+	if *out == "" {
+		*out = fmt.Sprintf("uv28-%s.json", time.Now().Format("20060102-150405"))
 	}
-	tr, err := Connect(f.addr, f.timeout, logger(f.verbose))
+	tr, err := Connect(*addr, *timeout, logger(*verbose))
 	if err != nil {
 		return err
 	}
 	defer tr.Close()
-	d := radio.NewDriver(tr, logger(f.verbose))
+	d := radio.NewDriver(tr, logger(*verbose))
 	fmt.Fprintln(os.Stderr, "Reading radio...")
 	im, err := d.ReadImage(progressBar("read"))
 	if err != nil {
@@ -210,27 +163,39 @@ func cmdRead(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(out, data, 0o644); err != nil {
+	if err := os.WriteFile(*out, data, 0o644); err != nil {
 		return err
 	}
 	n := countChannels(im)
-	fmt.Printf("Read OK. Model %q, %d channels. Saved to %s\n", im.Ident, n, out)
+	fmt.Printf("Read OK. Model %q, %d channels. Saved to %s\n", im.Ident, n, *out)
 	return nil
 }
 
 func cmdWrite(args []string) error {
-	f, err := parse(args)
-	if err != nil {
+	fs := flag.NewFlagSet("write", flag.ContinueOnError)
+	in := fs.String("i", "", "input image file (JSON)")
+	fs.StringVar(in, "in", "", "input image file (JSON)")
+	addr := fs.String("addr", "", "connect to a specific radio address")
+	backup := fs.String("backup", "", "path for the automatic backup (default: timestamped)")
+	timeout := fs.Duration("timeout", 20*time.Second, "scan/connect timeout")
+	verbose := fs.Bool("v", false, "verbose: log every Bluetooth packet")
+	fs.BoolVar(verbose, "verbose", false, "verbose: log every Bluetooth packet")
+	yes := fs.Bool("yes", false, "confirm the write (required)")
+	fs.BoolVar(yes, "y", false, "confirm the write (required)")
+	full := fs.Bool("full", false, "write all regions (advanced; default is channels only)")
+	noBackup := fs.Bool("no-backup", false, "skip the automatic backup")
+	forceMismatch := fs.Bool("force-mismatch", false, "allow writing even if image model differs from radio")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if f.in == "" {
+	if *in == "" {
 		return fmt.Errorf("write needs -i <image.json>")
 	}
-	im, err := loadImage(f.in)
+	im, err := loadImage(*in)
 	if err != nil {
 		return err
 	}
-	if !f.yes {
+	if !*yes {
 		return fmt.Errorf("writing to the radio changes it. Re-run with -yes to confirm.\n" +
 			"  (a full backup of the current radio is saved automatically first)")
 	}
@@ -238,22 +203,25 @@ func cmdWrite(args []string) error {
 	// The radio expects one operation per Bluetooth session, so the backup
 	// read and the write each use their own fresh connection (just like
 	// running two separate commands).
-	if !f.noBackup {
-		bpath := f.backup
+	if !*noBackup {
+		bpath := *backup
 		if bpath == "" {
 			bpath = fmt.Sprintf("uv28-backup-%s.json", time.Now().Format("20060102-150405"))
 		}
 		fmt.Fprintln(os.Stderr, "Backing up current radio contents first...")
-		tr, err := Connect(f.addr, f.timeout, logger(f.verbose))
+		tr, err := Connect(*addr, *timeout, logger(*verbose))
 		if err != nil {
 			return err
 		}
-		cur, err := radio.NewDriver(tr, logger(f.verbose)).ReadImage(progressBar("backup"))
+		cur, err := radio.NewDriver(tr, logger(*verbose)).ReadImage(progressBar("backup"))
 		tr.Close()
 		if err != nil {
 			return fmt.Errorf("backup read failed, aborting before any write: %w", err)
 		}
-		bdata, _ := cur.MarshalFile()
+		bdata, err := cur.MarshalFile()
+		if err != nil {
+			return fmt.Errorf("could not marshal backup, aborting: %w", err)
+		}
 		if err := os.WriteFile(bpath, bdata, 0o644); err != nil {
 			return fmt.Errorf("could not save backup, aborting: %w", err)
 		}
@@ -267,17 +235,17 @@ func cmdWrite(args []string) error {
 	// and must not be overwritten. -full writes every region (advanced).
 	only := channelBlocks()
 	scope := "channels"
-	if f.full {
+	if *full {
 		only = nil
 		scope = "all regions"
 	}
 	fmt.Fprintf(os.Stderr, "Writing to radio (%s)...\n", scope)
-	tr, err := Connect(f.addr, f.timeout, logger(f.verbose))
+	tr, err := Connect(*addr, *timeout, logger(*verbose))
 	if err != nil {
 		return err
 	}
 	defer tr.Close()
-	if err := radio.NewDriver(tr, logger(f.verbose)).WriteImage(im, only, progressBar("write")); err != nil {
+	if err := radio.NewDriver(tr, logger(*verbose)).WriteImage(im, only, *forceMismatch, progressBar("write")); err != nil {
 		return err
 	}
 	fmt.Println("Write OK.")
@@ -285,46 +253,55 @@ func cmdWrite(args []string) error {
 }
 
 func cmdExport(args []string) error {
-	f, err := parse(args)
-	if err != nil {
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	in := fs.String("i", "", "input image file (JSON)")
+	fs.StringVar(in, "in", "", "input image file (JSON)")
+	out := fs.String("o", "", "output CSV file")
+	fs.StringVar(out, "out", "", "output CSV file")
+	all := fs.Bool("all", false, "include empty channels")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if f.in == "" {
+	if *in == "" {
 		return fmt.Errorf("export needs -i <image.json>")
 	}
-	im, err := loadImage(f.in)
+	im, err := loadImage(*in)
 	if err != nil {
 		return err
 	}
-	out := f.out
-	if out == "" {
-		out = strings.TrimSuffix(filepath.Base(f.in), filepath.Ext(f.in)) + ".csv"
+	if *out == "" {
+		*out = strings.TrimSuffix(filepath.Base(*in), filepath.Ext(*in)) + ".csv"
 	}
-	fh, err := os.Create(out)
+	fh, err := os.Create(*out)
 	if err != nil {
 		return err
 	}
 	defer fh.Close()
-	if err := im.ExportCSV(fh, f.all); err != nil {
+	if err := im.ExportCSV(fh, *all); err != nil {
 		return err
 	}
-	fmt.Printf("Exported %d channels to %s\n", countChannels(im), out)
+	fmt.Printf("Exported %d channels to %s\n", countChannels(im), *out)
 	return nil
 }
 
 func cmdImport(args []string) error {
-	f, err := parse(args)
-	if err != nil {
+	fs := flag.NewFlagSet("import", flag.ContinueOnError)
+	in := fs.String("i", "", "input image file (JSON)")
+	fs.StringVar(in, "in", "", "input image file (JSON)")
+	csvPath := fs.String("csv", "", "CSV file with channel edits")
+	out := fs.String("o", "", "output image file (default: overwrite -i)")
+	fs.StringVar(out, "out", "", "output image file (default: overwrite -i)")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if f.in == "" || f.csv == "" {
+	if *in == "" || *csvPath == "" {
 		return fmt.Errorf("import needs -i <image.json> and -csv <channels.csv>")
 	}
-	im, err := loadImage(f.in)
+	im, err := loadImage(*in)
 	if err != nil {
 		return err
 	}
-	fh, err := os.Open(f.csv)
+	fh, err := os.Open(*csvPath)
 	if err != nil {
 		return err
 	}
@@ -333,30 +310,31 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	out := f.out
-	if out == "" {
-		out = f.in
+	if *out == "" {
+		*out = *in
 	}
 	data, err := im.MarshalFile()
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(out, data, 0o644); err != nil {
+	if err := os.WriteFile(*out, data, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("Merged %d channels from %s into %s\n", n, f.csv, out)
+	fmt.Printf("Merged %d channels from %s into %s\n", n, *csvPath, *out)
 	return nil
 }
 
 func cmdShow(args []string) error {
-	f, err := parse(args)
-	if err != nil {
+	fs := flag.NewFlagSet("show", flag.ContinueOnError)
+	in := fs.String("i", "", "input image file (JSON)")
+	fs.StringVar(in, "in", "", "input image file (JSON)")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if f.in == "" {
+	if *in == "" {
 		return fmt.Errorf("show needs -i <image.json>")
 	}
-	im, err := loadImage(f.in)
+	im, err := loadImage(*in)
 	if err != nil {
 		return err
 	}
@@ -433,7 +411,7 @@ func countChannels(im *radio.Image) int {
 }
 
 // channelBlocks returns the block addresses that hold channel records
-// (the first region), for -only-channels writes.
+// (the first region), for channel-only writes.
 func channelBlocks() []int {
 	var out []int
 	for _, a := range radio.Blocks() {

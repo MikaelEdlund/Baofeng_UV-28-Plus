@@ -52,20 +52,49 @@ func bcdFreqDecode(b []byte) (string, bool) {
 }
 
 // bcdFreqEncode turns a MHz string into 4 BCD bytes. Empty -> all 0xFF.
+// Uses pure integer/decimal parsing to avoid floating-point rounding issues.
 func bcdFreqEncode(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return []byte{0xFF, 0xFF, 0xFF, 0xFF}, nil
 	}
-	f, err := strconv.ParseFloat(s, 64)
-	if err != nil {
+	// Accept optional leading zeros and a single decimal point.
+	parts := strings.Split(s, ".")
+	if len(parts) > 2 {
 		return nil, fmt.Errorf("invalid frequency %q", s)
 	}
-	v := int64(f*100000 + 0.5) // 10 Hz units -> 8 digits
-	if v < 0 || v > 99999999 {
+	intPart := parts[0]
+	fracPart := ""
+	if len(parts) == 2 {
+		fracPart = parts[1]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	// Pad fractional part to 5 digits (10 Hz resolution).
+	for len(fracPart) < 5 {
+		fracPart += "0"
+	}
+	if len(fracPart) > 5 {
+		fracPart = fracPart[:5] // truncate extra precision
+	}
+	digits := intPart + fracPart
+	// Ensure exactly 8 digits by padding or rejecting.
+	if len(digits) > 8 {
 		return nil, fmt.Errorf("frequency out of range: %q", s)
 	}
-	digits := fmt.Sprintf("%08d", v)
+	for len(digits) < 8 {
+		digits = "0" + digits
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return nil, fmt.Errorf("invalid frequency %q", s)
+		}
+	}
+	v, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || v < 0 || v > 99999999 {
+		return nil, fmt.Errorf("frequency out of range: %q", s)
+	}
 	bcd := func(two string) byte {
 		hi := byte(two[0] - '0')
 		lo := byte(two[1] - '0')
@@ -77,6 +106,27 @@ func bcdFreqEncode(s string) ([]byte, error) {
 		bcd(digits[2:4]),
 		bcd(digits[0:2]),
 	}, nil
+}
+
+// checkFreqRange performs a conservative frequency-range check.
+// Typical dual-band amateur radios in this family cover roughly
+// 136–174 MHz (VHF) and 400–480 MHz (UHF). We accept a slightly wider
+// common subset and reject clearly invalid values.
+func checkFreqRange(model, freq string) error {
+	if freq == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(freq, 64)
+	if err != nil {
+		return fmt.Errorf("invalid frequency %q", freq)
+	}
+	// Conservative common subset for the UV-28 family.
+	// Allow a little margin for different advertised limits.
+	ok := (f >= 136.0 && f <= 174.0) || (f >= 400.0 && f <= 520.0)
+	if !ok {
+		return fmt.Errorf("frequency %s MHz is outside the conservative band limits for model %q (VHF 136-174 / UHF 400-520)", freq, model)
+	}
+	return nil
 }
 
 func decodeName(raw []byte) string {
@@ -183,10 +233,18 @@ func (im *Image) SetChannel(c Channel) error {
 	if err != nil {
 		return fmt.Errorf("ch %d rx: %w", c.Number, err)
 	}
+	if err := checkFreqRange(im.Ident, c.RXFreq); err != nil {
+		return fmt.Errorf("ch %d rx: %w", c.Number, err)
+	}
 	copy(fr[0:4], rx)
 	tx, err := bcdFreqEncode(c.TXFreq)
 	if err != nil {
 		return fmt.Errorf("ch %d tx: %w", c.Number, err)
+	}
+	if c.TXFreq != "" {
+		if err := checkFreqRange(im.Ident, c.TXFreq); err != nil {
+			return fmt.Errorf("ch %d tx: %w", c.Number, err)
+		}
 	}
 	copy(fr[4:8], tx)
 

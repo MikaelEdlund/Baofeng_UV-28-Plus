@@ -207,7 +207,10 @@ func (t *bleTransport) subscribe() error {
 			select {
 			case t.events <- cp:
 			default:
-				// drop if the consumer is far behind; the protocol retries.
+				if t.log != nil {
+					t.log("notification dropped (buffer full); will retry on next timeout")
+				}
+				// Drop forces a later timeout in the Driver, which triggers a retry.
 			}
 		})
 		if err == nil {

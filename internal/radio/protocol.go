@@ -3,6 +3,7 @@ package radio
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -33,6 +34,8 @@ const (
 	cmdRead      = 0x52                  // 'R'
 	cmdWrite     = 0x57                  // 'W'
 	blockLenByte = 0x80                  // length field in read/write frames (128)
+	maxRetries   = 3                     // attempts for each block read/write
+	retryDelay   = 50 * time.Millisecond
 )
 
 // BlockKeyIndex is the crypt table row used for block payloads. The vendor
@@ -202,43 +205,74 @@ func (d *Driver) EnterProgramMode() (ident string, info []byte, err error) {
 }
 
 // readBlock reads one 128-byte block at addr and returns decrypted data.
+// Retries up to maxRetries times on transient failures.
 func (d *Driver) readBlock(addr int) ([]byte, error) {
-	d.resetRx()
-	cmd := []byte{cmdRead, byte(addr >> 8), byte(addr), blockLenByte}
-	if err := d.writeData(cmd); err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		d.resetRx()
+		cmd := []byte{cmdRead, byte(addr >> 8), byte(addr), blockLenByte}
+		if err := d.writeData(cmd); err != nil {
+			lastErr = err
+			d.log("read 0x%04X attempt %d/%d failed (write): %v", addr, attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		frame, err := d.recv(4+BlockSize, frameTimeout)
+		if err != nil {
+			lastErr = fmt.Errorf("read 0x%04X: %w", addr, err)
+			d.log("read 0x%04X attempt %d/%d failed (recv): %v", addr, attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		if frame[0] != cmdRead || int(frame[3]) != blockLenByte {
+			lastErr = fmt.Errorf("read 0x%04X: bad header % X", addr, frame[:4])
+			d.log("read 0x%04X attempt %d/%d failed (header): %v", addr, attempt, maxRetries, lastErr)
+			time.Sleep(retryDelay)
+			continue
+		}
+		gotAddr := int(frame[1])<<8 | int(frame[2])
+		if gotAddr != addr {
+			lastErr = fmt.Errorf("read: asked 0x%04X got 0x%04X", addr, gotAddr)
+			d.log("read 0x%04X attempt %d/%d failed (addr): %v", addr, attempt, maxRetries, lastErr)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return Crypt(BlockKeyIndex, frame[4:]), nil
 	}
-	frame, err := d.recv(4+BlockSize, frameTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("read 0x%04X: %w", addr, err)
-	}
-	if frame[0] != cmdRead || int(frame[3]) != blockLenByte {
-		return nil, fmt.Errorf("read 0x%04X: bad header % X", addr, frame[:4])
-	}
-	gotAddr := int(frame[1])<<8 | int(frame[2])
-	if gotAddr != addr {
-		return nil, fmt.Errorf("read: asked 0x%04X got 0x%04X", addr, gotAddr)
-	}
-	return Crypt(BlockKeyIndex, frame[4:]), nil
+	return nil, fmt.Errorf("read 0x%04X failed after %d attempts: %w", addr, maxRetries, lastErr)
 }
 
 // writeBlock encrypts and writes one 128-byte block at addr.
+// Retries up to maxRetries times on transient failures.
 func (d *Driver) writeBlock(addr int, data []byte) error {
-	d.resetRx()
-	frame := make([]byte, 0, 4+BlockSize)
-	frame = append(frame, cmdWrite, byte(addr>>8), byte(addr), blockLenByte)
-	frame = append(frame, Crypt(BlockKeyIndex, data)...)
-	if err := d.writeData(frame); err != nil {
-		return err
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		d.resetRx()
+		frame := make([]byte, 0, 4+BlockSize)
+		frame = append(frame, cmdWrite, byte(addr>>8), byte(addr), blockLenByte)
+		frame = append(frame, Crypt(BlockKeyIndex, data)...)
+		if err := d.writeData(frame); err != nil {
+			lastErr = err
+			d.log("write 0x%04X attempt %d/%d failed (write): %v", addr, attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		a, err := d.recv(1, ackTimeout)
+		if err != nil {
+			lastErr = fmt.Errorf("write 0x%04X: no ack: %w", addr, err)
+			d.log("write 0x%04X attempt %d/%d failed (recv): %v", addr, attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		if a[0] != ack {
+			lastErr = fmt.Errorf("write 0x%04X: bad ack 0x%02X", addr, a[0])
+			d.log("write 0x%04X attempt %d/%d failed (ack): %v", addr, attempt, maxRetries, lastErr)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return nil
 	}
-	a, err := d.recv(1, ackTimeout)
-	if err != nil {
-		return fmt.Errorf("write 0x%04X: no ack: %w", addr, err)
-	}
-	if a[0] != ack {
-		return fmt.Errorf("write 0x%04X: bad ack 0x%02X", addr, a[0])
-	}
-	return nil
+	return fmt.Errorf("write 0x%04X failed after %d attempts: %w", addr, maxRetries, lastErr)
 }
 
 // ReadImage authenticates, enters program mode and reads all regions.
@@ -271,14 +305,24 @@ func (d *Driver) ReadImage(progress Progress) (*Image, error) {
 }
 
 // WriteImage authenticates, enters program mode and writes the given blocks
-// (or all blocks when onlyBlocks is nil).
-func (d *Driver) WriteImage(im *Image, onlyBlocks []int, progress Progress) error {
+// (or all blocks when onlyBlocks is nil). If forceMismatch is false, the
+// radio's reported model must match im.Ident (case-insensitive); otherwise
+// an error is returned so the caller can require explicit acknowledgement.
+func (d *Driver) WriteImage(im *Image, onlyBlocks []int, forceMismatch bool, progress Progress) error {
 	if err := d.Authenticate(); err != nil {
 		return err
 	}
-	if _, _, err := d.EnterProgramMode(); err != nil {
+	radioIdent, _, err := d.EnterProgramMode()
+	if err != nil {
 		return err
 	}
+	if !forceMismatch && im.Ident != "" && !strings.EqualFold(im.Ident, radioIdent) {
+		return fmt.Errorf("model mismatch: image is %q but radio reports %q (re-run with -force-mismatch to override)", im.Ident, radioIdent)
+	}
+	if im.Ident != "" && !strings.EqualFold(im.Ident, radioIdent) {
+		d.log("warning: model mismatch (image %q vs radio %q) — proceeding because -force-mismatch was set", im.Ident, radioIdent)
+	}
+
 	blocks := onlyBlocks
 	if blocks == nil {
 		blocks = Blocks()
