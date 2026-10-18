@@ -46,8 +46,9 @@ uv28prog.exe write  -i new.json -yes
 ```
 
 `write` reads and saves a timestamped backup first, then writes `new.json`.
-Use `-only-channels` to write just the channel memory and leave every other
-setting on the radio untouched (recommended once you only change channels).
+By default only the channel memory is written. Use `-full` to write every
+region (advanced). If the image's model string does not match the radio,
+the write is refused unless you add `-force-mismatch`.
 
 ## Commands
 
@@ -61,7 +62,8 @@ setting on the radio untouched (recommended once you only change channels).
 | `show -i FILE` | Print the channel list from an image. |
 
 Useful flags: `-addr <MAC>` to target a specific radio, `-timeout 30s`,
-and `-v` for a full packet-level log (paste this if you need help).
+`-v` for a full packet-level log, and `-force-mismatch` to override a model
+mismatch on write.
 
 `export`, `import` and `show` work on any OS; `scan`/`read`/`write` need the
 Windows build.

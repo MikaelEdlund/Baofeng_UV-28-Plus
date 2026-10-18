@@ -1,9 +1,23 @@
 package radio
 
-import "math/rand"
+import (
+	"crypto/rand"
+	"math/big"
+)
 
-type stdRand struct{}
+type cryptoRand struct{}
 
-func (stdRand) Intn(n int) int { return rand.Intn(n) }
+func (cryptoRand) Intn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	max := big.NewInt(int64(n))
+	v, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		// Fallback extremely unlikely; return 0.
+		return 0
+	}
+	return int(v.Int64())
+}
 
-func defaultRand() RandSource { return stdRand{} }
+func defaultRand() RandSource { return cryptoRand{} }
