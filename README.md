@@ -142,5 +142,5 @@ PROTOCOL.md         the reverse-engineered protocol
 This talks to **your own** radio over its own Bluetooth module to do what the
 vendor app does. It edits channel memory and round-trips all other settings
 byte-for-byte. Keep the backups it produces; if a write ever leaves the radio
-unhappy, `write` the backup file to restore it. You can also use the build in
+unhappy, `write` the backup file to restore it. You can also use the built in
 menu option `Radio Setting -> Reset` to restore to factory defaults.
