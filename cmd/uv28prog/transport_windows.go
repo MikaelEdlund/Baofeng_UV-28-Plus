@@ -208,9 +208,10 @@ func (t *bleTransport) subscribe() error {
 			case t.events <- cp:
 			default:
 				if t.log != nil {
-					t.log("notification dropped (buffer full); will retry on next timeout")
+					t.log("notification dropped (buffer full)")
 				}
-				// Drop forces a later timeout in the Driver, which triggers a retry.
+				// The Driver then times out waiting for the missing bytes:
+				// block reads are retried, anything else fails cleanly.
 			}
 		})
 		if err == nil {

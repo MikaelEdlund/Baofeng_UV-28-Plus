@@ -51,82 +51,121 @@ func bcdFreqDecode(b []byte) (string, bool) {
 	return digits[:3] + "." + digits[3:], true
 }
 
-// bcdFreqEncode turns a MHz string into 4 BCD bytes. Empty -> all 0xFF.
-// Uses pure integer/decimal parsing to avoid floating-point rounding issues.
-func bcdFreqEncode(s string) ([]byte, error) {
+// Frequencies are handled in units of 10 Hz, the resolution of the radio's
+// 8-digit BCD field (3 integer + 5 fractional MHz digits).
+const (
+	freqUnitsPerMHz = 100000
+	maxFreqUnits    = 99999999 // 999.99999 MHz
+)
+
+// parseFreq parses a MHz string such as "145.5" or "446.00625" into 10 Hz
+// units, rounding to the nearest 10 Hz. It uses decimal digit arithmetic
+// rather than floating point, so the value typed is the value stored.
+// Leading zeros are accepted ("050.00000" is how 50 MHz is exported).
+func parseFreq(s string) (int64, error) {
 	s = strings.TrimSpace(s)
-	if s == "" {
-		return []byte{0xFF, 0xFF, 0xFF, 0xFF}, nil
+	intPart, fracPart, _ := strings.Cut(s, ".")
+	if (intPart == "" && fracPart == "") || !allDigits(intPart) || !allDigits(fracPart) {
+		return 0, fmt.Errorf("invalid frequency %q", s)
 	}
-	// Accept optional leading zeros and a single decimal point.
-	parts := strings.Split(s, ".")
-	if len(parts) > 2 {
-		return nil, fmt.Errorf("invalid frequency %q", s)
+	intPart = strings.TrimLeft(intPart, "0")
+	if len(intPart) > 3 {
+		return 0, fmt.Errorf("frequency %q out of range", s)
 	}
-	intPart := parts[0]
-	fracPart := ""
-	if len(parts) == 2 {
-		fracPart = parts[1]
-	}
-	if intPart == "" {
-		intPart = "0"
-	}
-	// Pad fractional part to 5 digits (10 Hz resolution).
-	for len(fracPart) < 5 {
-		fracPart += "0"
-	}
+	roundUp := len(fracPart) > 5 && fracPart[5] >= '5'
 	if len(fracPart) > 5 {
-		fracPart = fracPart[:5] // truncate extra precision
+		fracPart = fracPart[:5]
 	}
-	digits := intPart + fracPart
-	// Ensure exactly 8 digits by padding or rejecting.
-	if len(digits) > 8 {
-		return nil, fmt.Errorf("frequency out of range: %q", s)
+	fracPart += strings.Repeat("0", 5-len(fracPart))
+	v, err := strconv.ParseInt(intPart+fracPart, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid frequency %q", s)
 	}
-	for len(digits) < 8 {
-		digits = "0" + digits
+	if roundUp {
+		v++
 	}
-	for _, c := range digits {
-		if c < '0' || c > '9' {
-			return nil, fmt.Errorf("invalid frequency %q", s)
+	if v > maxFreqUnits {
+		return 0, fmt.Errorf("frequency %q out of range", s)
+	}
+	return v, nil
+}
+
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
 		}
 	}
-	v, err := strconv.ParseInt(digits, 10, 64)
-	if err != nil || v < 0 || v > 99999999 {
-		return nil, fmt.Errorf("frequency out of range: %q", s)
-	}
+	return true
+}
+
+// freqToBCD packs a frequency in 10 Hz units into the radio's 4-byte
+// little-endian BCD form.
+func freqToBCD(v int64) []byte {
+	digits := fmt.Sprintf("%08d", v)
 	bcd := func(two string) byte {
-		hi := byte(two[0] - '0')
-		lo := byte(two[1] - '0')
-		return hi<<4 | lo
+		return (two[0]-'0')<<4 | (two[1] - '0')
 	}
 	return []byte{
 		bcd(digits[6:8]),
 		bcd(digits[4:6]),
 		bcd(digits[2:4]),
 		bcd(digits[0:2]),
-	}, nil
+	}
 }
 
-// checkFreqRange performs a conservative frequency-range check.
-// Typical dual-band amateur radios in this family cover roughly
-// 136–174 MHz (VHF) and 400–480 MHz (UHF). We accept a slightly wider
-// common subset and reject clearly invalid values.
-func checkFreqRange(model, freq string) error {
-	if freq == "" {
-		return nil
+// bcdFreqEncode turns a MHz string into 4 BCD bytes. Empty -> all 0xFF.
+// It only checks that the value fits the field; see channelFreq for the
+// band check applied to channel frequencies.
+func bcdFreqEncode(s string) ([]byte, error) {
+	if strings.TrimSpace(s) == "" {
+		return []byte{0xFF, 0xFF, 0xFF, 0xFF}, nil
 	}
-	f, err := strconv.ParseFloat(freq, 64)
+	v, err := parseFreq(s)
 	if err != nil {
-		return fmt.Errorf("invalid frequency %q", freq)
+		return nil, err
 	}
-	// Conservative common subset for the UV-28 family.
-	// Allow a little margin for different advertised limits.
-	ok := (f >= 136.0 && f <= 174.0) || (f >= 400.0 && f <= 520.0)
-	if !ok {
-		return fmt.Errorf("frequency %s MHz is outside the conservative band limits for model %q (VHF 136-174 / UHF 400-520)", freq, model)
+	return freqToBCD(v), nil
+}
+
+// freqBands are the ranges a channel frequency may use, in 10 Hz units. They
+// are the union of CHIRP's valid bands for the radios that share this
+// protocol (UV-28 Plus, UV-21 Pro, UV-32 Pro). Some of them are receive-only
+// (e.g. 108-136 MHz airband); the radio enforces its own transmit limits.
+// The point of the check is to catch typos such as 14.55 or 1455, not to
+// second-guess what the radio accepts.
+var freqBands = []struct{ lo, hi int64 }{
+	{108 * freqUnitsPerMHz, 174 * freqUnitsPerMHz}, // airband (RX) + 2 m
+	{200 * freqUnitsPerMHz, 260 * freqUnitsPerMHz}, // 1.25 m
+	{350 * freqUnitsPerMHz, 390 * freqUnitsPerMHz},
+	{400 * freqUnitsPerMHz, 520 * freqUnitsPerMHz}, // 70 cm
+}
+
+func freqBandList() string {
+	parts := make([]string, len(freqBands))
+	for i, b := range freqBands {
+		parts[i] = fmt.Sprintf("%d-%d", b.lo/freqUnitsPerMHz, b.hi/freqUnitsPerMHz)
 	}
-	return nil
+	return strings.Join(parts, ", ") + " MHz"
+}
+
+// channelFreq parses and band-checks a channel frequency and returns its BCD
+// encoding. Empty -> all 0xFF (for TX this means transmit disabled).
+func channelFreq(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return []byte{0xFF, 0xFF, 0xFF, 0xFF}, nil
+	}
+	v, err := parseFreq(s)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range freqBands {
+		if v >= b.lo && v <= b.hi {
+			return freqToBCD(v), nil
+		}
+	}
+	return nil, fmt.Errorf("frequency %s MHz is outside the radio's bands (%s)", s, freqBandList())
 }
 
 func decodeName(raw []byte) string {
@@ -229,23 +268,16 @@ func (im *Image) SetChannel(c Channel) error {
 		return nil
 	}
 
-	rx, err := bcdFreqEncode(c.RXFreq)
+	// Validate both frequencies before touching the record.
+	rx, err := channelFreq(c.RXFreq)
 	if err != nil {
 		return fmt.Errorf("ch %d rx: %w", c.Number, err)
 	}
-	if err := checkFreqRange(im.Ident, c.RXFreq); err != nil {
-		return fmt.Errorf("ch %d rx: %w", c.Number, err)
-	}
-	copy(fr[0:4], rx)
-	tx, err := bcdFreqEncode(c.TXFreq)
+	tx, err := channelFreq(c.TXFreq)
 	if err != nil {
 		return fmt.Errorf("ch %d tx: %w", c.Number, err)
 	}
-	if c.TXFreq != "" {
-		if err := checkFreqRange(im.Ident, c.TXFreq); err != nil {
-			return fmt.Errorf("ch %d tx: %w", c.Number, err)
-		}
-	}
+	copy(fr[0:4], rx)
 	copy(fr[4:8], tx)
 
 	rlo, rhi, err := encodeTone(c.RXTone)

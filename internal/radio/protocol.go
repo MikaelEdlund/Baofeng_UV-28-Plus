@@ -34,7 +34,7 @@ const (
 	cmdRead      = 0x52                  // 'R'
 	cmdWrite     = 0x57                  // 'W'
 	blockLenByte = 0x80                  // length field in read/write frames (128)
-	maxRetries   = 3                     // attempts for each block read/write
+	maxRetries   = 3                     // attempts for each block read (writes are never retried)
 	retryDelay   = 50 * time.Millisecond
 )
 
@@ -205,7 +205,9 @@ func (d *Driver) EnterProgramMode() (ident string, info []byte, err error) {
 }
 
 // readBlock reads one 128-byte block at addr and returns decrypted data.
-// Retries up to maxRetries times on transient failures.
+// Retries up to maxRetries times on transient failures. That is safe for
+// reads: they don't change the radio, and the echoed address in the reply
+// header rejects a stale or misaligned frame.
 func (d *Driver) readBlock(addr int) ([]byte, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -243,36 +245,32 @@ func (d *Driver) readBlock(addr int) ([]byte, error) {
 }
 
 // writeBlock encrypts and writes one 128-byte block at addr.
-// Retries up to maxRetries times on transient failures.
+//
+// Writes are deliberately NOT retried. The radio reads a write as one
+// fixed-length 132-byte frame with no way to resynchronise. If part of a
+// frame is lost (a dropped BLE chunk, or WriteData failing part-way), the
+// radio is left holding a partial frame; resending the whole frame would
+// complete that partial frame with the start of the new one, the radio would
+// commit the misaligned data and ACK it, and the single ACK byte cannot be
+// tied to an attempt, so the corruption would be reported as success.
+// Failing here leaves the block unwritten, and the caller's backup can
+// restore the radio.
 func (d *Driver) writeBlock(addr int, data []byte) error {
-	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		d.resetRx()
-		frame := make([]byte, 0, 4+BlockSize)
-		frame = append(frame, cmdWrite, byte(addr>>8), byte(addr), blockLenByte)
-		frame = append(frame, Crypt(BlockKeyIndex, data)...)
-		if err := d.writeData(frame); err != nil {
-			lastErr = err
-			d.log("write 0x%04X attempt %d/%d failed (write): %v", addr, attempt, maxRetries, err)
-			time.Sleep(retryDelay)
-			continue
-		}
-		a, err := d.recv(1, ackTimeout)
-		if err != nil {
-			lastErr = fmt.Errorf("write 0x%04X: no ack: %w", addr, err)
-			d.log("write 0x%04X attempt %d/%d failed (recv): %v", addr, attempt, maxRetries, err)
-			time.Sleep(retryDelay)
-			continue
-		}
-		if a[0] != ack {
-			lastErr = fmt.Errorf("write 0x%04X: bad ack 0x%02X", addr, a[0])
-			d.log("write 0x%04X attempt %d/%d failed (ack): %v", addr, attempt, maxRetries, lastErr)
-			time.Sleep(retryDelay)
-			continue
-		}
-		return nil
+	d.resetRx()
+	frame := make([]byte, 0, 4+BlockSize)
+	frame = append(frame, cmdWrite, byte(addr>>8), byte(addr), blockLenByte)
+	frame = append(frame, Crypt(BlockKeyIndex, data)...)
+	if err := d.writeData(frame); err != nil {
+		return fmt.Errorf("write 0x%04X: %w", addr, err)
 	}
-	return fmt.Errorf("write 0x%04X failed after %d attempts: %w", addr, maxRetries, lastErr)
+	a, err := d.recv(1, ackTimeout)
+	if err != nil {
+		return fmt.Errorf("write 0x%04X: no ack: %w", addr, err)
+	}
+	if a[0] != ack {
+		return fmt.Errorf("write 0x%04X: bad ack 0x%02X", addr, a[0])
+	}
+	return nil
 }
 
 // ReadImage authenticates, enters program mode and reads all regions.

@@ -7,8 +7,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,10 +82,46 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
 	}
+	if errors.Is(err, flag.ErrHelp) {
+		return // "<command> -h": the command's flags were printed
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// parseFlags parses a command's flags. The flag package's own printing is
+// silenced so that main reports an error exactly once; -h prints the
+// command's flags and returns flag.ErrHelp so main exits cleanly.
+//
+// Leftover positional arguments are an error: the flag package stops at the
+// first one, so it and every flag after it would otherwise be ignored
+// (e.g. "import -i mine.json -csv ch.csv new.json" would overwrite mine.json).
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	fs.SetOutput(io.Discard)
+	err := fs.Parse(args)
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Printf("Usage: uv28prog %s [flags]\n\nFlags:\n", fs.Name())
+		fs.SetOutput(os.Stdout)
+		fs.PrintDefaults()
+		return flag.ErrHelp
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w (see 'uv28prog %s -h')", fs.Name(), err, fs.Name())
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%s: unexpected argument %q; give files with flags such as -i/-o (see 'uv28prog %s -h')",
+			fs.Name(), fs.Arg(0), fs.Name())
+	}
+	return nil
+}
+
+// verboseFlag registers -v and its long form -verbose.
+func verboseFlag(fs *flag.FlagSet, usage string) *bool {
+	v := fs.Bool("v", false, usage)
+	fs.BoolVar(v, "verbose", false, "same as -v")
+	return v
 }
 
 func logger(verbose bool) radio.Logger {
@@ -113,9 +151,8 @@ func cmdScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	addr := fs.String("addr", "", "connect to a specific radio address (from 'scan')")
 	timeout := fs.Duration("timeout", 20*time.Second, "scan/connect timeout")
-	verbose := fs.Bool("v", false, "verbose: log every Bluetooth packet")
-	fs.BoolVar(verbose, "verbose", false, "verbose: log every Bluetooth packet")
-	if err := fs.Parse(args); err != nil {
+	verbose := verboseFlag(fs, "verbose: log every Bluetooth packet")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Scanning for radios (turn the radio on, keep it close)...")
@@ -140,9 +177,8 @@ func cmdRead(args []string) error {
 	fs.StringVar(out, "out", "", "output image file (JSON)")
 	addr := fs.String("addr", "", "connect to a specific radio address")
 	timeout := fs.Duration("timeout", 20*time.Second, "scan/connect timeout")
-	verbose := fs.Bool("v", false, "verbose: log every Bluetooth packet")
-	fs.BoolVar(verbose, "verbose", false, "verbose: log every Bluetooth packet")
-	if err := fs.Parse(args); err != nil {
+	verbose := verboseFlag(fs, "verbose: log every Bluetooth packet")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *out == "" {
@@ -178,14 +214,15 @@ func cmdWrite(args []string) error {
 	addr := fs.String("addr", "", "connect to a specific radio address")
 	backup := fs.String("backup", "", "path for the automatic backup (default: timestamped)")
 	timeout := fs.Duration("timeout", 20*time.Second, "scan/connect timeout")
-	verbose := fs.Bool("v", false, "verbose: log every Bluetooth packet")
-	fs.BoolVar(verbose, "verbose", false, "verbose: log every Bluetooth packet")
+	verbose := verboseFlag(fs, "verbose: log every Bluetooth packet")
 	yes := fs.Bool("yes", false, "confirm the write (required)")
 	fs.BoolVar(yes, "y", false, "confirm the write (required)")
 	full := fs.Bool("full", false, "write all regions (advanced; default is channels only)")
 	noBackup := fs.Bool("no-backup", false, "skip the automatic backup")
 	forceMismatch := fs.Bool("force-mismatch", false, "allow writing even if image model differs from radio")
-	if err := fs.Parse(args); err != nil {
+	// Kept so existing commands keep working; channel-only is now the default.
+	fs.Bool("only-channels", false, "ignored (writing only channels is the default; see -full)")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" {
@@ -259,7 +296,8 @@ func cmdExport(args []string) error {
 	out := fs.String("o", "", "output CSV file")
 	fs.StringVar(out, "out", "", "output CSV file")
 	all := fs.Bool("all", false, "include empty channels")
-	if err := fs.Parse(args); err != nil {
+	verboseFlag(fs, "accepted for consistency (offline commands have nothing to log)")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" {
@@ -291,7 +329,8 @@ func cmdImport(args []string) error {
 	csvPath := fs.String("csv", "", "CSV file with channel edits")
 	out := fs.String("o", "", "output image file (default: overwrite -i)")
 	fs.StringVar(out, "out", "", "output image file (default: overwrite -i)")
-	if err := fs.Parse(args); err != nil {
+	verboseFlag(fs, "accepted for consistency (offline commands have nothing to log)")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" || *csvPath == "" {
@@ -328,7 +367,8 @@ func cmdShow(args []string) error {
 	fs := flag.NewFlagSet("show", flag.ContinueOnError)
 	in := fs.String("i", "", "input image file (JSON)")
 	fs.StringVar(in, "in", "", "input image file (JSON)")
-	if err := fs.Parse(args); err != nil {
+	verboseFlag(fs, "accepted for consistency (offline commands have nothing to log)")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" {
