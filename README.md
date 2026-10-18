@@ -8,11 +8,14 @@ It reverse-implements the vendor app's protocol (see `PROTOCOL.md`). It reads
 the radio to a backup file, lets you edit channels as a plain CSV in any
 spreadsheet, and writes them back.
 
-> ⚠️ **This is built from reverse engineering and has not yet been tested
-> against a physical radio.** Treat the first read as the important test.
-> `read` is non-destructive; always keep the backup it makes before you
-> `write`. `write` also saves a fresh backup of the radio automatically before
-> changing anything.
+> ⚠️ **This is built from reverse engineering and has so far been tested
+> successfully against only one physical radio (the author's own).** Other
+> radios, firmware versions and Bluetooth modules may behave differently, so
+> treat your first `read` as the important test. `read` is non-destructive;
+> always keep the backup it makes before you `write`. `write` also saves a
+> fresh backup of the radio automatically before changing anything.
+>
+> Whether it works for you or not, please [share how it went](#feedback).
 
 ## Quick start
 
@@ -97,7 +100,20 @@ Run with `-v` and look at the log:
   one spot where some modules need an extra baud-set step — see the end of
   `PROTOCOL.md`).
 * Anything else — the `-v` log from the point of failure is the thing to
-  capture.
+  capture, and to include when you report it (see [Feedback](#feedback)).
+
+## Feedback
+
+So far this tool has been confirmed on a single radio, so every report helps,
+including "it just worked". Please
+[open an issue](https://github.com/MikaelEdlund/Baofeng_UV-28-Plus/issues) and
+say:
+
+* which radio you have, and the model string that `read` prints
+  (e.g. `Model "UV28PRO"`)
+* your Windows version
+* which commands you ran (`scan`, `read`, `write`, …) and whether they worked
+* if something failed, the `-v` log from the point of failure
 
 ## Building from source
 
@@ -126,4 +142,5 @@ PROTOCOL.md         the reverse-engineered protocol
 This talks to **your own** radio over its own Bluetooth module to do what the
 vendor app does. It edits channel memory and round-trips all other settings
 byte-for-byte. Keep the backups it produces; if a write ever leaves the radio
-unhappy, `write` the backup file to restore it.
+unhappy, `write` the backup file to restore it. You can also use the built in
+menu option `Radio Setting -> Reset` to restore to factory defaults.
